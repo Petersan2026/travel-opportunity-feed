@@ -1,6 +1,6 @@
 import { chromium } from "playwright";
 
-type RawExploreOpportunity = {
+export type RawExploreOpportunity = {
   destination: string;
   dateRange: string;
   price: number;
@@ -28,11 +28,11 @@ function isDurationLine(line: string): boolean {
   return /^\d+\shr(?:\s\d+\smin)?$/i.test(line);
 }
 
-function extractOpportunities(lines: string[]): RawExploreOpportunity[] {
+export function extractOpportunities(lines: string[]): RawExploreOpportunity[] {
   const results: RawExploreOpportunity[] = [];
   const seen = new Set<string>();
 
-  for (let i = 0; i <= lines.length - 5; i += 1) {
+  for (let i = 0; i <= lines.length - 5; i++) {
     const destination = lines[i];
     const dateRange = lines[i + 1];
     const priceLine = lines[i + 2];
@@ -64,21 +64,7 @@ function extractOpportunities(lines: string[]): RawExploreOpportunity[] {
   return results;
 }
 
-async function main() {
-  const browser = await chromium.launch({
-    headless: false,
-  });
-
-  const page = await browser.newPage();
-
-  await page.goto("https://www.google.com/travel/explore", {
-    waitUntil: "networkidle",
-  });
-
-  console.log("Google Flights Explore loaded");
-
-  await page.waitForTimeout(5000);
-
+async function scrapeViewport(page: any): Promise<RawExploreOpportunity[]> {
   const bodyText = await page.locator("body").innerText();
 
   const lines = bodyText
@@ -86,15 +72,95 @@ async function main() {
     .map(normalizeLine)
     .filter(Boolean);
 
+  console.log(`Lines: ${lines.length}`);
+
   const opportunities = extractOpportunities(lines);
+  console.log(`Extracted: ${opportunities.length}`);
 
-  console.log(JSON.stringify(opportunities, null, 2));
-
-  await page.waitForTimeout(10000);
-  await browser.close();
+  return opportunities;
 }
 
-main().catch((error) => {
-  console.error("Explore extraction test failed:", error);
-  process.exit(1);
-});
+/**
+ * FIXED EUROPE POSITIONING
+ * Strategy:
+ * 1. Drag FAR past Europe (overshoot)
+ * 2. Zoom out to widen coverage
+ * 3. Let Google stabilize
+ */
+async function panToEurope(page: any): Promise<void> {
+  console.log("Panning aggressively past Europe...");
+
+  await page.mouse.move(800, 400);
+
+  // BIG sweeps left (force crossing Atlantic completely)
+  for (let i = 0; i < 4; i++) {
+    await page.mouse.down();
+    await page.mouse.move(50, 400, { steps: 30 }); // much further left
+    await page.mouse.up();
+    await page.waitForTimeout(1200);
+  }
+
+  // Now slight correction back right (centers Europe better)
+  for (let i = 0; i < 1; i++) {
+    await page.mouse.down();
+    await page.mouse.move(400, 400, { steps: 20 });
+    await page.mouse.up();
+    await page.waitForTimeout(1200);
+  }
+
+  console.log("Zooming out for continental coverage...");
+
+  for (let i = 0; i < 5; i++) {
+    await page.mouse.wheel(0, -1500);
+    await page.waitForTimeout(1000);
+  }
+
+  console.log("Allowing map to stabilize...");
+  await page.waitForTimeout(5000);
+}
+
+export async function extractGoogleExploreOpportunities(): Promise<
+  RawExploreOpportunity[]
+> {
+  console.log("Launching browser...");
+
+  const browser = await chromium.launch({
+    headless: false,
+  });
+
+  try {
+    const page = await browser.newPage();
+
+    console.log("Loading Explore...");
+    await page.goto("https://www.google.com/travel/explore", {
+      waitUntil: "domcontentloaded",
+    });
+
+    await page.waitForTimeout(6000);
+
+    // PASS 1
+    console.log("=== PASS 1: US ===");
+    const us = await scrapeViewport(page);
+
+    // PASS 2
+    console.log("=== PASS 2: EUROPE ===");
+    await panToEurope(page);
+    const eu = await scrapeViewport(page);
+
+    // merge + dedupe
+    const map = new Map<string, RawExploreOpportunity>();
+
+    for (const op of [...us, ...eu]) {
+      const key = `${op.destination}-${op.dateRange}-${op.price}`;
+      map.set(key, op);
+    }
+
+    const final = Array.from(map.values());
+
+    console.log(`Final count: ${final.length}`);
+
+    return final;
+  } finally {
+    await browser.close();
+  }
+}
